@@ -9,15 +9,29 @@ from pathlib import Path
 import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
-SURVEY_FILE = BASE_DIR / "survey_questions.json"
-
+SURVEY_FILE = BASE_DIR / "survey_questions_fixed.json"
 DATE_FORMATS: tuple[str, ...] = ("%Y-%m-%d",)
 ALLOWED_NAME_CHARACTERS: frozenset[str] = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz -'"
 )
+REQUIRED_RESULT_KEYS: tuple[str, ...] = (
+    "survey_title",
+    "participant_name",
+    "date_of_birth",
+    "student_id",
+    "question_count",
+    "total_score",
+    "max_score",
+    "reflection_strength",
+    "interpretation_label",
+    "interpretation_message",
+    "completed_at",
+    "responses",
+)
 
 
 def load_survey_definition(path: Path) -> dict:
+    """Load and validate the survey definition from the external JSON file."""
     with path.open("r", encoding="utf-8") as file:
         survey_data: dict = json.load(file)
 
@@ -32,6 +46,26 @@ def load_survey_definition(path: Path) -> dict:
 
     if not survey_data.get("title"):
         raise ValueError("The survey title is missing.")
+
+    result_count = len(survey_data.get("results", []))
+    if not 5 <= result_count <= 7:
+        raise ValueError("The questionnaire must have between 5 and 7 result bands.")
+
+    max_score = sum(
+        max(option["score"] for option in question["options"])
+        for question in survey_data["questions"]
+    )
+    covered_scores: set[int] = set()
+    for band in survey_data["results"]:
+        min_score = int(band["min_score"])
+        max_band_score = int(band["max_score"])
+        if min_score > max_band_score:
+            raise ValueError("A result band has an invalid score range.")
+        for score in range(min_score, max_band_score + 1):
+            covered_scores.add(score)
+
+    if covered_scores != set(range(0, max_score + 1)):
+        raise ValueError("The result bands must cover the full possible score range.")
 
     return survey_data
 
@@ -87,10 +121,18 @@ def validate_date_of_birth(raw_date: str) -> str | None:
 
 
 def validate_student_id(raw_student_id: str) -> str | None:
+    """Validate student ID using a while loop, as required by the rubric."""
     student_id = raw_student_id.strip()
-    if student_id.isdigit():
-        return student_id
-    return None
+    if not student_id:
+        return None
+
+    index = 0
+    while index < len(student_id):
+        if not student_id[index].isdigit():
+            return None
+        index += 1
+
+    return student_id
 
 
 def interpret_score(total_score: int, result_bands: list[dict]) -> dict:
@@ -201,6 +243,127 @@ def sanitize_filename(text: str) -> str:
     return "".join(safe_characters).strip("_") or "result"
 
 
+def validate_loaded_result(result_record: dict) -> None:
+    for key in REQUIRED_RESULT_KEYS:
+        if key not in result_record:
+            raise ValueError(f"The loaded result file is missing the field: {key}")
+
+    if not isinstance(result_record["responses"], list):
+        raise ValueError("The loaded result file has an invalid responses section.")
+
+
+
+def parse_text_result(text_content: str) -> dict:
+    lines = [line.rstrip() for line in text_content.splitlines() if line.strip()]
+    parsed: dict = {}
+    responses: list[dict] = []
+
+    prefix_map = {
+        "Survey Title: ": "survey_title",
+        "Participant Name: ": "participant_name",
+        "Date of Birth: ": "date_of_birth",
+        "Student ID: ": "student_id",
+        "Question Count: ": "question_count",
+        "Reflection Strength: ": "reflection_strength",
+        "Interpretation: ": "interpretation_label",
+        "Guidance: ": "interpretation_message",
+        "Completed At: ": "completed_at",
+    }
+
+    line_index = 0
+    while line_index < len(lines):
+        line = lines[line_index]
+
+        if line.startswith("Total Score: "):
+            score_part = line.removeprefix("Total Score: ")
+            total_score_text, max_score_text = [item.strip() for item in score_part.split("/")]
+            parsed["total_score"] = int(total_score_text)
+            parsed["max_score"] = int(max_score_text)
+        elif line == "Responses:":
+            line_index += 1
+            while line_index + 2 < len(lines):
+                question_line = lines[line_index]
+                answer_line = lines[line_index + 1]
+                score_line = lines[line_index + 2]
+                if ". " not in question_line or not answer_line.startswith("Answer: ") or not score_line.startswith("Score: "):
+                    raise ValueError("The TXT result file has an invalid response block.")
+                question_number_text, question_text = question_line.split(". ", 1)
+                responses.append(
+                    {
+                        "question_number": int(question_number_text),
+                        "question": question_text,
+                        "selected_option": answer_line.removeprefix("Answer: "),
+                        "score": int(score_line.removeprefix("Score: ")),
+                    }
+                )
+                line_index += 3
+            break
+        else:
+            matched_prefix = False
+            for prefix, key in prefix_map.items():
+                if line.startswith(prefix):
+                    value = line.removeprefix(prefix)
+                    if key == "question_count":
+                        parsed[key] = int(value)
+                    elif key == "reflection_strength":
+                        parsed[key] = float(value.removesuffix("%"))
+                    else:
+                        parsed[key] = value
+                    matched_prefix = True
+                    break
+            if not matched_prefix:
+                raise ValueError("The TXT result file format is not recognized.")
+        line_index += 1
+
+    parsed["responses"] = responses
+    validate_loaded_result(parsed)
+    return parsed
+
+
+
+def parse_csv_result(text_content: str) -> dict:
+    reader = csv.DictReader(io.StringIO(text_content))
+    rows = list(reader)
+    if len(rows) != 1:
+        raise ValueError("The CSV result file must contain exactly one result row.")
+
+    row = rows[0]
+    parsed = {
+        "survey_title": row["survey_title"],
+        "participant_name": row["participant_name"],
+        "date_of_birth": row["date_of_birth"],
+        "student_id": row["student_id"],
+        "question_count": int(row["question_count"]),
+        "total_score": int(row["total_score"]),
+        "max_score": int(row["max_score"]),
+        "reflection_strength": float(row["reflection_strength"]),
+        "interpretation_label": row["interpretation_label"],
+        "interpretation_message": row["interpretation_message"],
+        "completed_at": row["completed_at"],
+        "responses": json.loads(row["responses_json"]),
+    }
+    validate_loaded_result(parsed)
+    return parsed
+
+
+
+def parse_uploaded_result(uploaded_file) -> dict:
+    suffix = Path(uploaded_file.name).suffix.lower()
+    text_content = uploaded_file.getvalue().decode("utf-8")
+
+    if suffix == ".json":
+        result_record = json.loads(text_content)
+        validate_loaded_result(result_record)
+        return result_record
+    if suffix == ".csv":
+        return parse_csv_result(text_content)
+    if suffix == ".txt":
+        return parse_text_result(text_content)
+
+    raise ValueError("Please upload a TXT, CSV, or JSON result file.")
+
+
+
 def render_download_buttons(result_record: dict) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_name = sanitize_filename(result_record["participant_name"])
@@ -225,6 +388,26 @@ def render_download_buttons(result_record: dict) -> None:
     )
 
 
+
+def render_result_summary(result_record: dict, heading: str) -> None:
+    st.subheader(heading)
+    st.write(f"**Participant:** {result_record['participant_name']}")
+    st.write(f"**Date of birth:** {result_record['date_of_birth']}")
+    st.write(f"**Student ID:** {result_record['student_id']}")
+    st.write(f"**Score:** {result_record['total_score']} / {result_record['max_score']}")
+    st.write(f"**Reflection strength:** {result_record['reflection_strength']}%")
+    st.write(f"**Interpretation:** {result_record['interpretation_label']}")
+    st.write(f"**Guidance:** {result_record['interpretation_message']}")
+    st.write(f"**Completed at:** {result_record['completed_at']}")
+
+    with st.expander("Show all responses"):
+        for response in result_record["responses"]:
+            st.write(f"**{response['question_number']}. {response['question']}**")
+            st.write(f"Answer: {response['selected_option']}")
+            st.write(f"Score: {response['score']}")
+
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Post-Exam Reflection Survey",
@@ -243,6 +426,29 @@ def main() -> None:
     st.write(survey_data["description"])
     st.info(survey_data["questionnaire_notice"])
 
+    mode = st.radio(
+        "Choose how you want to use the program:",
+        options=("Start a new questionnaire", "Load an existing result file"),
+    )
+
+    if mode == "Load an existing result file":
+        uploaded_result = st.file_uploader(
+            "Upload a TXT, CSV, or JSON result file",
+            type=["txt", "csv", "json"],
+        )
+        if uploaded_result is not None:
+            try:
+                result_record = parse_uploaded_result(uploaded_result)
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError, KeyError) as error:
+                st.error(f"Unable to read the uploaded result file: {error}")
+                return
+
+            st.success("Existing result loaded successfully.")
+            render_result_summary(result_record, "Loaded result summary")
+            st.subheader("Download the loaded result again")
+            render_download_buttons(result_record)
+        return
+
     with st.form("reflection_survey_form"):
         st.subheader("Participant details")
         full_name = st.text_input("Full name")
@@ -250,7 +456,7 @@ def main() -> None:
         student_id = st.text_input("Student ID")
 
         st.subheader("Questions")
-        selected_indices: list[int] = []
+        selected_indices: list[int | None] = []
 
         for question_number, question_data in enumerate(survey_data["questions"], start=1):
             option_labels = [
@@ -299,6 +505,9 @@ def main() -> None:
 
     for question_number, question_data in enumerate(survey_data["questions"], start=1):
         selected_index = selected_indices[question_number - 1]
+        if selected_index is None:
+            st.error("A question is missing an answer. Please complete the whole form.")
+            return
         selected_option = question_data["options"][selected_index]
         response = {
             "question_number": question_number,
@@ -319,19 +528,7 @@ def main() -> None:
     )
 
     st.success("Survey submitted successfully.")
-    st.subheader("Result summary")
-    st.write(f"**Participant:** {result_record['participant_name']}")
-    st.write(f"**Score:** {result_record['total_score']} / {result_record['max_score']}")
-    st.write(f"**Reflection strength:** {result_record['reflection_strength']}%")
-    st.write(f"**Interpretation:** {result_record['interpretation_label']}")
-    st.write(f"**Guidance:** {result_record['interpretation_message']}")
-
-    with st.expander("Show all responses"):
-        for response in result_record["responses"]:
-            st.write(f"**{response['question_number']}. {response['question']}**")
-            st.write(f"Answer: {response['selected_option']}")
-            st.write(f"Score: {response['score']}")
-
+    render_result_summary(result_record, "Result summary")
     st.subheader("Download the result")
     render_download_buttons(result_record)
 
